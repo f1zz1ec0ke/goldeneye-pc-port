@@ -44,6 +44,8 @@ void gfx_start_frame(void);
 void gfx_run(Gfx* commands);
 void gfx_end_frame(void);
 void gfx_set_target_fps(int);
+/* D409: render an interpolated in-between frame per game frame (see gfx_pc.cpp). */
+void gfx_set_frame_interpolation(int on, int vi_rate);
 void gfx_set_texture_filter(enum FilteringMode mode);
 void gfx_set_mipmap_filter(enum MipmapFilteringMode mode);
 void gfx_set_fix_mip_textures(int on);
