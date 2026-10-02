@@ -616,7 +616,7 @@ void videoNoteInterpFrame(void)
 
 /* D409: a cap above the console VI rate turns on fast3d's frame
  * interpolation (the sim itself stays at 60/50 Hz -- see gfx_pc.cpp) and
- * paces presents at twice the VI rate. With VSync on, every swap waits for a
+ * presents twice per VI tick. With VSync on, every swap waits for a
  * display refresh, so on a display slower than that the two presents per
  * tick would halve the SIM rate (D186); interpolation is held off there until
  * VSync is turned off or the window lands on a fast enough display. */
@@ -631,8 +631,10 @@ static void videoApplyFpsCap(void)
     const int ok = want && (!cfgVSync || hz >= 2 * vi - 5);
     const int state = !want ? 0 : (ok ? 1 : 2);
 
-    gfx_set_frame_interpolation(ok, vi);
-    gfx_set_target_fps(ok ? 2 * vi : (want ? vi : cfgFpsCap));
+    /* With interpolation on, fast3d paces its own two presents per tick
+     * (gfx_pc.cpp gfx_run), so the window-level frame cap is off. */
+    gfx_set_frame_interpolation(ok, vi, hz, cfgVSync);
+    gfx_set_target_fps(ok ? 0 : (want ? vi : cfgFpsCap));
 
     if (state != lastState) {
         lastState = state;

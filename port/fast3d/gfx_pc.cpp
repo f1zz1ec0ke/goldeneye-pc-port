@@ -1472,7 +1472,15 @@ static bool s_interp_enabled = false;
 static bool s_interp_have_prev = false;
 static uintptr_t s_interp_next_geo = 0;
 static uint64_t s_interp_last_run_ns = 0;
-static uint64_t s_interp_max_gap_ns = 25000000; /* 1.5 NTSC ticks */
+static uint64_t s_interp_tick_ns = 16666667;   /* one VI tick */
+static uint64_t s_interp_refresh_ns = 0;       /* display refresh period; 0 = unknown */
+static bool s_interp_vsync = false;
+static double s_interp_pass_ema_ns = 0;        /* smoothed cost of one render pass */
+static bool s_interp_too_slow = false;
+/* Deferred present of the real frame (see gfx_run). */
+static bool s_present_pending = false;
+static uint64_t s_present_deadline_ns = 0;
+static uint64_t s_pass_render_ns = 0;          /* last pass: start -> just before swap */
 static std::unordered_map<uint64_t, InterpMtx> s_interp_prev, s_interp_cur;
 static std::unordered_map<uint64_t, uint32_t> s_interp_occ;
 
@@ -4432,63 +4440,187 @@ static double s_perf_dl = 0, s_perf_run = 0, s_perf_present = 0, s_perf_interval
 static double s_perf_pre = 0, s_perf_post = 0, s_perf_swap = 0;
 static uint64_t s_perf_frames = 0, s_perf_last_start = 0;
 
-static void gfx_run_pass(Gfx* commands);
+static void gfx_run_pass(Gfx* commands, bool swap);
 
-extern "C" void gfx_set_frame_interpolation(int on, int vi_rate) {
+extern "C" void gfx_set_frame_interpolation(int on, int vi_rate, int refresh_hz, int vsync) {
     if (vi_rate > 0) {
-        s_interp_max_gap_ns = 1500000000ULL / (uint64_t)vi_rate;
+        s_interp_tick_ns = 1000000000ULL / (uint64_t)vi_rate;
     }
+    s_interp_refresh_ns = refresh_hz > 0 ? 1000000000ULL / (uint64_t)refresh_hz : 0;
+    s_interp_vsync = vsync != 0;
     s_interp_enabled = on != 0;
 }
 
 /* Present hook for the extra frame (video.c counts it toward the FPS stats). */
 extern "C" void videoNoteInterpFrame(void);
 
+/* D409 GE_INTERPSTAT=1: every ~5 s, how many ticks got an in-between frame
+ * and why the rest did not, the per-pass render cost, and the spacing of the
+ * presents. Test-only, zero cost unset. */
+static struct {
+    int on = -1;
+    uint32_t ticks, blended, skip_noprev, skip_stale, skip_slow, early_flush;
+    double pass_ms, gap_ms, ab_ms;
+    uint64_t last_present_ns, a_present_ns;
+} s_istat;
+
+static void gfx_interp_stat_flush(void) {
+    if (s_istat.ticks < 300) {
+        return;
+    }
+    const double n = (double)s_istat.ticks;
+    sysLogPrintf(LOG_INFO,
+        "INTERPSTAT ticks=%u blended=%u skip(noprev=%u stale=%u slow=%u) early_flush=%u "
+        "pass=%.2fms tick_gap=%.2fms a_to_b=%.2fms vsync=%d refresh=%.2fms",
+        s_istat.ticks, s_istat.blended, s_istat.skip_noprev, s_istat.skip_stale, s_istat.skip_slow,
+        s_istat.early_flush, s_istat.pass_ms / n, s_istat.gap_ms / n,
+        s_istat.blended ? s_istat.ab_ms / s_istat.blended : 0.0,
+        (int)s_interp_vsync, s_interp_refresh_ns / 1.0e6);
+    s_istat.ticks = s_istat.blended = s_istat.skip_noprev = s_istat.skip_stale = 0;
+    s_istat.skip_slow = s_istat.early_flush = 0;
+    s_istat.pass_ms = s_istat.gap_ms = s_istat.ab_ms = 0;
+}
+
+/* D409: microseconds until the deferred real-frame present is due (0 = due
+ * now), or -1 when nothing is pending. Polled by the scheduler thread's
+ * message wait (port/src/libultra.c osRecvMesg). */
+extern "C" int64_t gfx_pending_present_wait_us(void) {
+    if (!s_present_pending) {
+        return -1;
+    }
+    const uint64_t now = gfx_perf_now_ns();
+    return now >= s_present_deadline_ns ? 0 : (int64_t)((s_present_deadline_ns - now + 999) / 1000);
+}
+
+/* Swap the already-rendered real frame. Render (scheduler) thread only. */
+extern "C" void gfx_present_pending(void) {
+    if (!s_present_pending) {
+        return;
+    }
+    s_present_pending = false;
+    gfx_wapi->swap_buffers_begin();
+    gfx_rapi->finish_render();
+    gfx_wapi->swap_buffers_end();
+    if (s_istat.on > 0) {
+        const uint64_t now = gfx_perf_now_ns();
+        s_istat.ab_ms += (double)(now - s_istat.a_present_ns) / 1.0e6;
+    }
+}
+
 extern "C" void gfx_run(Gfx* commands) {
+    /* A real frame still waiting for its slot is shown now rather than lost
+     * (only when the next DL beats its deadline). */
+    if (s_present_pending) {
+        gfx_present_pending();
+        if (s_istat.on > 0) {
+            s_istat.early_flush++;
+        }
+    }
+
     if (!s_interp_enabled) {
         if (s_interp_mode != INTERP_OFF) {
             s_interp_mode = INTERP_OFF;
             s_interp_have_prev = false;
+            s_interp_too_slow = false;
+            s_interp_pass_ema_ns = 0;
             s_interp_prev.clear();
             s_interp_cur.clear();
         }
-        gfx_run_pass(commands);
+        gfx_run_pass(commands, true);
         return;
     }
 
-    /* D409: skip the in-between frame when there is no usable previous
-     * frame, or when frames are arriving late (the extra pass would only
-     * slow the sim further -- degrade to plain 60 until it catches up). */
+    if (s_istat.on < 0) {
+        s_istat.on = getenv("GE_INTERPSTAT") != NULL;
+    }
+
+    /* D409 pacing. The scheduler thread runs this inline, and that same
+     * thread is what forwards VI retraces to the game thread -- the game only
+     * starts its next frame on a forwarded retrace (boss.c). So it must not
+     * sit here waiting for the real frame's present slot: both passes are
+     * rendered back to back, the in-between frame is swapped at once, and the
+     * real frame's swap is DEFERRED to half a tick later, performed from the
+     * scheduler's own message wait (gfx_present_pending via osRecvMesg).
+     * (First cut waited inline at 2x the VI rate: gfx_run then held the
+     * thread for most of the tick, retraces were forwarded late, the sim
+     * slipped to 2-tick frames and the blend was dropped on those -- ~70-84
+     * fps measured on a user's machine.) */
     const uint64_t now = gfx_perf_now_ns();
-    const bool on_time = s_interp_last_run_ns != 0 && now - s_interp_last_run_ns <= s_interp_max_gap_ns;
+    const bool stale = s_interp_last_run_ns == 0 || now - s_interp_last_run_ns > 4 * s_interp_tick_ns;
+    if (s_istat.on > 0 && s_interp_last_run_ns != 0 && !stale) {
+        s_istat.gap_ms += (double)(now - s_interp_last_run_ns) / 1.0e6;
+    }
     s_interp_last_run_ns = now;
 
-    if (s_interp_have_prev && on_time) {
+    /* Too slow to afford a second pass: hysteresis on the smoothed cost. */
+    if (s_interp_pass_ema_ns > 0.40 * (double)s_interp_tick_ns) {
+        s_interp_too_slow = true;
+    } else if (s_interp_pass_ema_ns < 0.30 * (double)s_interp_tick_ns) {
+        s_interp_too_slow = false;
+    }
+
+    bool blended = false;
+    if (s_interp_have_prev && !stale && !s_interp_too_slow) {
         uintptr_t segs[16];
         struct RSP rsp_saved;
         memcpy(segs, segmentPointers, sizeof(segs));
         memcpy(&rsp_saved, &rsp, sizeof(rsp));
         s_interp_mode = INTERP_BLEND;
         s_interp_occ.clear();
-        gfx_run_pass(commands);
+        gfx_run_pass(commands, true);
         if (!dropped_frame) {
             gfx_rapi->finish_render();
             gfx_wapi->swap_buffers_end();
             videoNoteInterpFrame();
+            blended = true;
         }
         memcpy(segmentPointers, segs, sizeof(segs));
         memcpy(&rsp, &rsp_saved, sizeof(rsp));
     }
+    const uint64_t a_ns = gfx_perf_now_ns();
 
     s_interp_mode = INTERP_RECORD;
     s_interp_occ.clear();
     s_interp_cur.clear();
-    gfx_run_pass(commands);
+    gfx_run_pass(commands, !blended);
     s_interp_prev.swap(s_interp_cur);
     s_interp_have_prev = !dropped_frame;
+
+    const double pass = (double)s_pass_render_ns;
+    s_interp_pass_ema_ns = s_interp_pass_ema_ns > 0 ? 0.9 * s_interp_pass_ema_ns + 0.1 * pass : pass;
+
+    if (blended) {
+        /* Due half a tick after the in-between frame. With VSync the swap
+         * itself then waits for a refresh, so aim one refresh early. */
+        uint64_t delay = s_interp_tick_ns / 2;
+        if (s_interp_vsync && s_interp_refresh_ns) {
+            delay = delay > s_interp_refresh_ns ? delay - s_interp_refresh_ns : 0;
+        } else {
+            delay = delay > 500000 ? delay - 500000 : 0;
+        }
+        s_present_deadline_ns = a_ns + delay;
+        s_present_pending = true;
+    }
+
+    if (s_istat.on > 0) {
+        s_istat.ticks++;
+        s_istat.pass_ms += pass / 1.0e6;
+        s_istat.a_present_ns = a_ns;
+        if (blended) {
+            s_istat.blended++;
+        } else if (stale) {
+            s_istat.skip_stale++;
+        } else if (s_interp_too_slow) {
+            s_istat.skip_slow++;
+        } else {
+            s_istat.skip_noprev++;
+        }
+        gfx_interp_stat_flush();
+    }
 }
 
-static void gfx_run_pass(Gfx* commands) {
+static void gfx_run_pass(Gfx* commands, bool swap) {
+    const uint64_t pass_t0 = gfx_perf_now_ns();
     s_hud_scale = 1.0f;   /* D226: never carry a HUD scale across frames */
     const uint64_t perf_t0 = gfx_perfstat_on() ? gfx_perf_now_ns() : 0;
     ++num_dls;
@@ -4545,7 +4677,10 @@ static void gfx_run_pass(Gfx* commands) {
 
     gfx_rapi->end_frame();
     const uint64_t perf_tpost = perf_t0 ? gfx_perf_now_ns() : 0;
-    gfx_wapi->swap_buffers_begin();
+    s_pass_render_ns = gfx_perf_now_ns() - pass_t0;
+    if (swap) {
+        gfx_wapi->swap_buffers_begin();
+    }
     if (perf_t0) {
         s_perf_pre += (double)(perf_tpre - perf_t0) / 1.0e6;
         s_perf_post += (double)(perf_tpost - perf_t1) / 1.0e6;
@@ -4561,7 +4696,7 @@ static void gfx_run_pass(Gfx* commands) {
 
 extern "C" void gfx_end_frame(void) {
     const uint64_t perf_t0 = gfx_perfstat_on() ? gfx_perf_now_ns() : 0;
-    if (!dropped_frame) {
+    if (!dropped_frame && !s_present_pending) { /* D409: a deferred present finishes itself */
         gfx_rapi->finish_render();
         gfx_wapi->swap_buffers_end();
     }
