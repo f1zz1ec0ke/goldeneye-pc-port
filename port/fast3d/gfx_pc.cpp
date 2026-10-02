@@ -4454,33 +4454,6 @@ extern "C" void gfx_set_frame_interpolation(int on, int vi_rate, int refresh_hz,
 /* Present hook for the extra frame (video.c counts it toward the FPS stats). */
 extern "C" void videoNoteInterpFrame(void);
 
-/* D409 GE_INTERPSTAT=1: every ~5 s, how many ticks got an in-between frame
- * and why the rest did not, the per-pass render cost, and the spacing of the
- * presents. Test-only, zero cost unset. */
-static struct {
-    int on = -1;
-    uint32_t ticks, blended, skip_noprev, skip_stale, skip_slow, early_flush;
-    double pass_ms, gap_ms, ab_ms;
-    uint64_t a_present_ns;
-} s_istat;
-
-static void gfx_interp_stat_flush(void) {
-    if (s_istat.ticks < 300) {
-        return;
-    }
-    const double n = (double)s_istat.ticks;
-    sysLogPrintf(LOG_INFO,
-        "INTERPSTAT ticks=%u blended=%u skip(noprev=%u stale=%u slow=%u) early_flush=%u "
-        "pass=%.2fms tick_gap=%.2fms a_to_b=%.2fms vsync=%d refresh=%.2fms",
-        s_istat.ticks, s_istat.blended, s_istat.skip_noprev, s_istat.skip_stale, s_istat.skip_slow,
-        s_istat.early_flush, s_istat.pass_ms / n, s_istat.gap_ms / n,
-        s_istat.blended ? s_istat.ab_ms / s_istat.blended : 0.0,
-        (int)s_interp_vsync, s_interp_refresh_ns / 1.0e6);
-    s_istat.ticks = s_istat.blended = s_istat.skip_noprev = s_istat.skip_stale = 0;
-    s_istat.skip_slow = s_istat.early_flush = 0;
-    s_istat.pass_ms = s_istat.gap_ms = s_istat.ab_ms = 0;
-}
-
 /* D409: microseconds until the deferred real-frame present is due (0 = due
  * now), or -1 when nothing is pending. Polled by the scheduler thread's
  * message wait (port/src/libultra.c osRecvMesg). */
@@ -4501,10 +4474,6 @@ extern "C" void gfx_present_pending(void) {
     gfx_wapi->swap_buffers_begin();
     gfx_rapi->finish_render();
     gfx_wapi->swap_buffers_end();
-    if (s_istat.on > 0) {
-        const uint64_t now = gfx_perf_now_ns();
-        s_istat.ab_ms += (double)(now - s_istat.a_present_ns) / 1.0e6;
-    }
 }
 
 extern "C" void gfx_run(Gfx* commands) {
@@ -4512,9 +4481,6 @@ extern "C" void gfx_run(Gfx* commands) {
      * (only when the next DL beats its deadline). */
     if (s_present_pending) {
         gfx_present_pending();
-        if (s_istat.on > 0) {
-            s_istat.early_flush++;
-        }
     }
 
     if (!s_interp_enabled) {
@@ -4530,10 +4496,6 @@ extern "C" void gfx_run(Gfx* commands) {
         return;
     }
 
-    if (s_istat.on < 0) {
-        s_istat.on = getenv("GE_INTERPSTAT") != NULL;
-    }
-
     /* D409 pacing. The scheduler thread runs this inline, and that same
      * thread is what forwards VI retraces to the game thread -- the game only
      * starts its next frame on a forwarded retrace (boss.c). So it must not
@@ -4547,9 +4509,6 @@ extern "C" void gfx_run(Gfx* commands) {
      * fps measured on a user's machine.) */
     const uint64_t now = gfx_perf_now_ns();
     const bool stale = s_interp_last_run_ns == 0 || now - s_interp_last_run_ns > 4 * s_interp_tick_ns;
-    if (s_istat.on > 0 && s_interp_last_run_ns != 0 && !stale) {
-        s_istat.gap_ms += (double)(now - s_interp_last_run_ns) / 1.0e6;
-    }
     s_interp_last_run_ns = now;
 
     /* Too slow to afford a second pass: hysteresis on the smoothed cost. */
@@ -4600,22 +4559,6 @@ extern "C" void gfx_run(Gfx* commands) {
         }
         s_present_deadline_ns = a_ns + delay;
         s_present_pending = true;
-    }
-
-    if (s_istat.on > 0) {
-        s_istat.ticks++;
-        s_istat.pass_ms += pass / 1.0e6;
-        s_istat.a_present_ns = a_ns;
-        if (blended) {
-            s_istat.blended++;
-        } else if (stale) {
-            s_istat.skip_stale++;
-        } else if (s_interp_too_slow) {
-            s_istat.skip_slow++;
-        } else {
-            s_istat.skip_noprev++;
-        }
-        gfx_interp_stat_flush();
     }
 }
 
