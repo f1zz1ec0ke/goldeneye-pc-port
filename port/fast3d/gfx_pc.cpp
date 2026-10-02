@@ -4461,7 +4461,7 @@ static struct {
     int on = -1;
     uint32_t ticks, blended, skip_noprev, skip_stale, skip_slow, early_flush;
     double pass_ms, gap_ms, ab_ms;
-    uint64_t last_present_ns, a_present_ns;
+    uint64_t a_present_ns;
 } s_istat;
 
 static void gfx_interp_stat_flush(void) {
